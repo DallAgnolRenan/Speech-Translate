@@ -147,13 +147,12 @@ def unique_rec_list(list_of_data: List):
     if len(list_of_data) == 0:
         return list_of_data
 
-    if isinstance(list_of_data[0], str):
-        # Convert the list to a set to get unique values then convert them back to a list
-        unique_lists = list(OrderedDict.fromkeys(list_of_data))
-    else:
-        seen = set()
-        unique_lists = []
-        for obj in list_of_data:
+    seen = set()
+    unique_lists = []
+    for obj in list_of_data:
+        if isinstance(obj, str):
+            check = obj
+        else:
             meta = ""
             try:
                 # get some metadata in first segment to make it more unique
@@ -164,9 +163,10 @@ def unique_rec_list(list_of_data: List):
                 pass
 
             check = f"{obj.text} {meta}"
-            if check not in seen:
-                unique_lists.append(obj)
-                seen.add(check)
+
+        if check not in seen:
+            unique_lists.append(obj)
+            seen.add(check)
 
     return unique_lists
 
