@@ -38,11 +38,18 @@ def tl_batch_with_tqdm(self, batch: List[str], **kwargs) -> list:
     return arr
 
 
+_http_session = requests.Session()
+
 # Import the translator
 try:
     from deep_translator import GoogleTranslator, MyMemoryTranslator
     GoogleTranslator._translate_batch = tl_batch_with_tqdm
     MyMemoryTranslator._translate_batch = tl_batch_with_tqdm
+
+    from deep_translator import google as _dt_google
+    from deep_translator import mymemory as _dt_mymemory
+    _dt_google.requests = _http_session
+    _dt_mymemory.requests = _http_session
 except Exception as e:
     GoogleTranslator = None
     MyMemoryTranslator = None
@@ -68,6 +75,17 @@ class TranslationConnection:
 
 
 TlCon = TranslationConnection(GoogleTranslator, MyMemoryTranslator)
+
+_tl_instance_cache: Dict = {}
+
+
+def get_cached_translator(translator_class, source: str, target: str, proxies: Dict):
+    key = (translator_class.__name__, source, target, repr(proxies))
+    instance = _tl_instance_cache.get(key)
+    if instance is None:
+        instance = translator_class(source=source, target=target, proxies=proxies)
+        _tl_instance_cache[key] = instance
+    return instance
 
 
 def google_tl(text: List[str], from_lang: str, to_lang: str, proxies: Dict, debug_log: bool = False, **kwargs):
@@ -124,8 +142,8 @@ def google_tl(text: List[str], from_lang: str, to_lang: str, proxies: Dict, debu
         if kwargs.pop("live_input", False):
             tl_kwargs["with_tqdm"] = False
 
-        result = TlCon.GoogleTranslator(source=LCODE_FROM, target=LCODE_TO,
-                                        proxies=proxies).translate_batch(text, **tl_kwargs)
+        result = get_cached_translator(TlCon.GoogleTranslator, LCODE_FROM, LCODE_TO,
+                                       proxies).translate_batch(text, **tl_kwargs)
         is_success = True
     except Exception as e:
         logger.exception(e)
@@ -193,8 +211,8 @@ def memory_tl(text: List[str], from_lang: str, to_lang: str, proxies: Dict, debu
         if kwargs.pop("live_input", False):
             tl_kwargs["with_tqdm"] = False
 
-        result = TlCon.MyMemoryTranslator(source=LCODE_FROM, target=LCODE_TO,
-                                          proxies=proxies).translate_batch(text, **tl_kwargs)
+        result = get_cached_translator(TlCon.MyMemoryTranslator, LCODE_FROM, LCODE_TO,
+                                       proxies).translate_batch(text, **tl_kwargs)
         is_success = True
     except Exception as e:
         result = str(e)
@@ -267,7 +285,7 @@ def libre_tl(
         if kwargs.pop("live_input", False):
             for q in text:
                 req["q"] = q
-                response = requests.post(libre_link, json=req, proxies=proxies, timeout=5).json()
+                response = _http_session.post(libre_link, json=req, proxies=proxies, timeout=5).json()
                 if "error" in response:
                     raise Exception(response["error"])
                 translated = response["translatedText"]
@@ -275,7 +293,7 @@ def libre_tl(
         else:
             for q in tqdm(text, desc="Translating"):
                 req["q"] = q
-                response = requests.post(libre_link, json=req, proxies=proxies, timeout=5).json()
+                response = _http_session.post(libre_link, json=req, proxies=proxies, timeout=5).json()
                 if "error" in response:
                     raise Exception(response["error"])
                 translated = response["translatedText"]

@@ -4,11 +4,12 @@ from ast import literal_eval
 from datetime import datetime, timedelta
 from io import BytesIO
 from platform import system
+from queue import Empty, Queue
 from shlex import quote
 from threading import Lock, Thread
 from time import gmtime, sleep, strftime, time
 from tkinter import IntVar, Toplevel, ttk
-from wave import Wave_read, Wave_write
+from wave import Wave_write
 from wave import open as w_open
 
 import numpy as np
@@ -46,6 +47,28 @@ else:
 
 ERROR_CON_NOTIFIED = False
 ERROR_CON_NOFIFIED_AMOUNT = 0
+
+FREEZE_PUNCTUATIONS = (".", "?", "!", "。", "？", "！")
+
+
+def get_freeze_cut(result, real_duration: float, min_buffer_s: float = 3.0, margin_s: float = 0.5):
+    segments = getattr(result, "segments", None)
+    if not segments or len(segments) < 2 or real_duration < min_buffer_s:
+        return None, None, 0.0
+
+    freeze_idx = -1
+    for i in range(len(segments) - 2, -1, -1):
+        seg = segments[i]
+        if seg.end <= real_duration - margin_s and seg.text.strip().endswith(FREEZE_PUNCTUATIONS):
+            freeze_idx = i
+            break
+
+    if freeze_idx == -1:
+        return None, None, 0.0
+
+    frozen_text = "".join(s.text for s in segments[:freeze_idx + 1]).strip()
+    tail_text = "".join(s.text for s in segments[freeze_idx + 1:]).strip()
+    return frozen_text, tail_text, segments[freeze_idx].end
 
 
 # -------------------------------------------------------------------------------------------------------------------------
@@ -116,6 +139,7 @@ def record_session(
         max_sentences = int(sj.cache.get(f"max_sentences_{rec_type}", 5))
         sentence_limitless = sj.cache.get(f"{rec_type}_no_limit", False)
         tl_engine_whisper = engine in model_values
+        segment_freeze = sj.cache.get("realtime_segment_freeze", True) and not (is_tl and tl_engine_whisper)
 
         taskname = "Transcribe & Translate" if is_tc and is_tl else "Transcribe" if is_tc else "Translate"
         more_information = f"\n> Language: {lang_source} → {lang_target}" if is_tl else f"\n> Language: {lang_source}"
@@ -660,6 +684,51 @@ def record_session(
 
         logger.debug("Recording session started")
 
+        tl_queue: Queue = Queue()
+        tl_outstanding = [0]
+        tl_outstanding_lock = Lock()
+
+        def tl_enqueue(item):
+            with tl_outstanding_lock:
+                tl_outstanding[0] += 1
+            tl_queue.put(item)
+
+        def tl_flush(timeout: float = 3.0):
+            deadline = time() + timeout
+            while tl_outstanding[0] > 0 and time() < deadline:
+                sleep(0.01)
+
+        def tl_api_worker():
+            while bc.recording:
+                try:
+                    items = [tl_queue.get(timeout=0.1)]
+                except Empty:
+                    continue
+
+                try:
+                    while True:
+                        items.append(tl_queue.get_nowait())
+                except Empty:
+                    pass
+
+                finals = [it for it in items if it[5]]
+                lives = [it for it in items if not it[5]]
+                process = finals + lives[-1:]
+
+                try:
+                    for it in process:
+                        try:
+                            tl_api(*it)
+                        except Exception as e:
+                            logger.exception(e)
+                finally:
+                    with tl_outstanding_lock:
+                        tl_outstanding[0] -= len(items)
+
+        if is_tl and not tl_engine_whisper:
+            bc.rec_tl_thread = Thread(target=tl_api_worker, daemon=True)
+            bc.rec_tl_thread.start()
+
         def break_buffer_store_update():
             """
             Break the buffer (last_sample). Resetting the buffer means that the buffer will be cleared and
@@ -681,6 +750,8 @@ def record_session(
                 if len(bc.tc_sentences) > 0:
                     bc.update_tc(None, separator)
             if is_tl:
+                if not tl_engine_whisper:
+                    tl_flush()
                 if prev_tl_res:
                     bc.tl_sentences.append(prev_tl_res)
                 bc.tl_sentences = unique_rec_list(bc.tl_sentences)
@@ -706,6 +777,7 @@ def record_session(
                         bc.current_rec_status = "💤 Idle (Buffer Cleared)"
                         if sj.cache["debug_realtime_record"]:
                             logger.debug("Silence found for more than 1 second. Buffer reseted")
+                sleep(0.01)
                 continue
 
             # update now if there is audio being recorded
@@ -718,6 +790,7 @@ def record_session(
             # Run transcription based on transcribe rate that is set by user.
             # The more delay it have the more it will reduces stress on the GPU / CPU (if using cpu).
             if next_transcribe_time > now:
+                sleep(0.01)
                 continue
 
             # update next_transcribe_time
@@ -731,26 +804,10 @@ def record_session(
             if sj.cache["debug_realtime_record"]:
                 logger.info("Processing Audio")
 
-            # need to make temp in memory to make sure the audio will be read properly
-            wf = BytesIO()
-            wav_writer: Wave_write = w_open(wf, "wb")
-            wav_writer.setframerate(WHISPER_SR if not use_temp else sr_ori)
-            wav_writer.setsampwidth(samp_width)
-            wav_writer.setnchannels(num_of_channels)
-            wav_writer.writeframes(last_sample)
-            wav_writer.close()
-            wf.seek(0)
-
             duration_seconds = len(last_sample) / (samp_width * sr_divider)
             if not use_temp:
-                # Read the audio data
-                wav_reader: Wave_read = w_open(wf)
-                samples = wav_reader.getnframes()
-                audio_bytes = wav_reader.readframes(samples)
-                wav_reader.close()
-
-                # Convert the wave data straight to a numpy array for the model.
-                audio_as_np_int16 = np.frombuffer(audio_bytes, dtype=np.int16).flatten()
+                # Convert the raw bytes straight to a numpy array for the model.
+                audio_as_np_int16 = np.frombuffer(last_sample, dtype=np.int16).flatten()
                 audio_as_np_float32 = audio_as_np_int16.astype(np.float32)
                 if num_of_channels == 1:
                     audio_np = audio_as_np_float32 / max_int16  # normalized as Numpy array
@@ -773,6 +830,15 @@ def record_session(
                 if sj.cache["debug_recorded_audio"]:
                     wav.write(generate_temp_filename(dir_debug), WHISPER_SR, audio_np)
             else:
+                wf = BytesIO()
+                wav_writer: Wave_write = w_open(wf, "wb")
+                wav_writer.setframerate(sr_ori)
+                wav_writer.setsampwidth(samp_width)
+                wav_writer.setnchannels(num_of_channels)
+                wav_writer.writeframes(last_sample)
+                wav_writer.close()
+                wf.seek(0)
+
                 # add to the temp list to delete later
                 audio_target = generate_temp_filename(dir_temp)
                 temp_list.append(audio_target)
@@ -861,25 +927,52 @@ def record_session(
                         else:
                             logger.debug(f"{text}")
 
-                    prev_tc_res = result
-                    bc.update_tc(result, separator)
+                    frozen_text, tail_text, cut_time = None, None, 0.0
+                    if segment_freeze:
+                        cut_rate = WHISPER_SR if not use_temp else sr_ori
+                        real_duration = len(last_sample) / (samp_width * num_of_channels * cut_rate)
+                        frozen_text, tail_text, cut_time = get_freeze_cut(result, real_duration)
 
-                    if is_tl:
-                        bc.current_rec_status = "▶️ Recording ⟳ Translating text"
-                        if tl_engine_whisper:
-                            bc.rec_tl_thread = Thread(
-                                target=run_whisper_tl,
-                                args=[audio_target, stable_tl, separator, True, hallucination_filters],
-                                kwargs=whisper_args,
-                                daemon=True
-                            )
-                        else:
-                            bc.rec_tl_thread = Thread(
-                                target=tl_api, args=[text, lang_source, lang_target, engine, separator], daemon=True
-                            )
+                    if frozen_text:
+                        frame_bytes = samp_width * num_of_channels
+                        cut = int(cut_time * cut_rate) * frame_bytes
+                        last_sample = last_sample[cut:]
+                        duration_seconds = len(last_sample) / (samp_width * sr_divider)
 
-                        bc.rec_tl_thread.start()
-                        bc.rec_tl_thread.join()
+                        if sj.cache["debug_realtime_record"]:
+                            logger.debug(f"Segment freeze at {cut_time:.2f}s | Frozen: {frozen_text}")
+
+                        bc.tc_sentences.append(frozen_text)
+                        bc.tc_sentences = unique_rec_list(bc.tc_sentences)
+                        if not sentence_limitless and len(bc.tc_sentences) > max_sentences:
+                            bc.tc_sentences.pop(0)
+
+                        prev_tc_res = tail_text
+                        bc.update_tc(tail_text if tail_text else None, separator)
+
+                        if is_tl:
+                            bc.current_rec_status = "▶️ Recording ⟳ Translating text"
+                            prev_tl_res = ""
+                            tl_enqueue((frozen_text, lang_source, lang_target, engine, separator, True))
+                            if tail_text:
+                                tl_enqueue((tail_text, lang_source, lang_target, engine, separator, False))
+                    else:
+                        prev_tc_res = result
+                        bc.update_tc(result, separator)
+
+                        if is_tl:
+                            bc.current_rec_status = "▶️ Recording ⟳ Translating text"
+                            if tl_engine_whisper:
+                                bc.rec_tl_thread = Thread(
+                                    target=run_whisper_tl,
+                                    args=[audio_target, stable_tl, separator, True, hallucination_filters],
+                                    kwargs=whisper_args,
+                                    daemon=True
+                                )
+                                bc.rec_tl_thread.start()
+                                bc.rec_tl_thread.join()
+                            else:
+                                tl_enqueue((text, lang_source, lang_target, engine, separator, False))
 
             if use_temp and not sj.cache["keep_temp"]:
                 os.remove(audio_target)  # type: ignore
@@ -967,9 +1060,12 @@ def record_cb(in_data, _frame_count, _time_info, _status):
 
     try:
         # Run resample and use resampled audio if not using temp file
-        resampled = resample_sr(in_data, sr_ori, WHISPER_SR)
-        if not use_temp:  # when use_temp will use the original audio
-            in_data = resampled
+        need_vad = threshold_enable and threshold_auto
+        resampled = None
+        if not use_temp or not vad_checked or need_vad:
+            resampled = resample_sr(in_data, sr_ori, WHISPER_SR)
+            if not use_temp:  # when use_temp will use the original audio
+                in_data = resampled
 
         # run vad at least once to check if it is possible to use with current device config
         if not vad_checked:
@@ -1076,7 +1172,7 @@ def run_whisper_tl(audio, stable_tl, separator: str, with_lock, hallucination_fi
         bc.update_tl(result, separator)
 
 
-def tl_api(text: str, lang_source: str, lang_target: str, engine: str, separator: str):
+def tl_api(text: str, lang_source: str, lang_target: str, engine: str, separator: str, final: bool = False):
     """Translate the result of realtime_recording_thread using translation API"""
     assert bc.mw is not None
     global prev_tl_res
@@ -1096,8 +1192,13 @@ def tl_api(text: str, lang_source: str, lang_target: str, engine: str, separator
 
         result = result[0]
         if result is not None and len(result) > 0:
-            prev_tl_res = result.strip()
-            bc.update_tl(result.strip(), separator)
+            if final:
+                bc.tl_sentences.append(result.strip())
+                bc.tl_sentences = unique_rec_list(bc.tl_sentences)
+                bc.update_tl(None, separator)
+            else:
+                prev_tl_res = result.strip()
+                bc.update_tl(result.strip(), separator)
     except Exception as e:
         logger.exception(e)
         global ERROR_CON_NOTIFIED, ERROR_CON_NOFIFIED_AMOUNT

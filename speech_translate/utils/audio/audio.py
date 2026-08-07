@@ -1,5 +1,6 @@
 # pylint: disable=deprecated-module
 from audioop import rms as calculate_rms
+from functools import lru_cache
 from io import BytesIO
 from wave import Wave_read, Wave_write
 from wave import open as w_open
@@ -68,6 +69,13 @@ def frame_generator(frame_duration_ms, audio, sample_rate, get_only_first_frame=
             break
 
 
+@lru_cache(maxsize=8)
+def get_antialias_coeffs(sample_rate: int, filter_order: int = 4):
+    nyquist = 0.5 * sample_rate
+    cutoff = 0.9 * nyquist
+    return butter(filter_order, cutoff / nyquist, btype='lowpass')
+
+
 def resample_sr(data: bytes, sample_rate: int, target_sample_rate: int) -> bytes:
     """
     This function resamples the audio data from a given sample rate to a target sample rate.
@@ -94,13 +102,7 @@ def resample_sr(data: bytes, sample_rate: int, target_sample_rate: int) -> bytes
     audio_as_np_int16 = frombuffer(data, dtype=int16)  # read as numpy array of int16
     audio_as_np_float32 = audio_as_np_int16.astype(float32)  # convert to float32
 
-    # Filter the audio with a anti aliasing filter
-    nyquist = 0.5 * sample_rate  # nyquist frequency / folding frequency
-    cutoff = 0.9 * nyquist  # Adjust the cutoff frequency as needed
-
-    # Use a butterworth filter with order of 4
-    filter_order = 4
-    b, a = butter(filter_order, cutoff / nyquist, btype='lowpass')
+    b, a = get_antialias_coeffs(sample_rate)
 
     # Filter the audio using filtfilt (zero-phase filtering)
     filtered_audio = filtfilt(b, a, audio_as_np_float32)

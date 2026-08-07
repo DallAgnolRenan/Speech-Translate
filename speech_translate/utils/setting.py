@@ -159,12 +159,13 @@ default_setting: SettingDict = {
     "use_faster_whisper": True,
     "use_en_model": True,
     "transcribe_rate": 300,
+    "realtime_segment_freeze": True,
     # option for some DecodingOptions that is not available in the command line parameter is moved to the gui
-    "decoding_preset": "beam search",  # greedy, beam search, custom
-    "temperature": "0.0, 0.2, 0.4, 0.6, 0.8, 1.0",  # 0.0 - 1.0
-    "best_of": 3,
-    "beam_size": 3,
-    "patience": 1.0,
+    "decoding_preset": "greedy",  # greedy, beam search, custom
+    "temperature": "0.0",  # 0.0 - 1.0
+    "best_of": None,
+    "beam_size": None,
+    "patience": None,
     "compression_ratio_threshold": 2.4,
     "logprob_threshold": -1.0,
     "no_speech_threshold": 0.72,  # Whisper default is 0.6 
@@ -172,7 +173,7 @@ default_setting: SettingDict = {
     "initial_prompt": None,
     "prefix": None,
     "suppress_blank": True,
-    "condition_on_previous_text": True,
+    "condition_on_previous_text": False,
     "max_initial_timestamp": 1.0,
     "fp16": True,
     "whisper_args": "",

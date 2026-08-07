@@ -226,6 +226,7 @@ class SettingDict(TypedDict):
     use_faster_whisper: bool
     use_en_model: bool
     transcribe_rate: int
+    realtime_segment_freeze: bool
     decoding_preset: str  # greedy beam search custom
     temperature: str  # 0.0 - 1.0
     best_of: Optional[int]
