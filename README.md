@@ -19,6 +19,63 @@ Speech Translate is a practical application that combines OpenAI's Whisper ASR m
 
 Speech Translate aims to expand whisper ability by combining it with some translation APIs while also providing a simple and easy to use interface to create a more practical application. This application is also open source, so you can contribute to this project if you want to.
 
+---
+
+## 📌 About this fork
+
+This fork runs the **translation step on a local LibreTranslate container** instead of the public free APIs, and carries a few robustness fixes for long live-recording sessions.
+
+**Why.** Live transcription produces a very high request rate — around 170 segments per minute in practice. No free public translation service sustains that: Google starts serving a CAPTCHA page (`Our systems have detected unusual traffic`) and MyMemory runs out of quota, both surfacing as a misleading `TooManyRequests: ... according to google, 5 requests per second` error. Running the engine locally removes the quota entirely.
+
+Transcription was never affected — Whisper always runs locally on the GPU.
+
+### Setup
+
+Start the translation server once:
+
+```bash
+docker run -d --name libretranslate --restart unless-stopped -p 5000:5000 \
+  -v libretranslate_models:/home/libretranslate/.local/share/argos-translate \
+  libretranslate/libretranslate:latest \
+  --load-only en,pt --threads 2 --translation-cache all --disable-web-ui
+```
+
+- `--load-only en,pt` keeps only the language pair in use (adjust to your languages)
+- `--threads 2` avoids the default 4 gunicorn workers competing to load the model, which made them hit `WORKER TIMEOUT` and restart in a loop, so the first request never completed
+- `--translation-cache all` matters in live mode, where the same partial sentence is re-translated as it grows
+- the named volume keeps the ~159MB of language models across container recreations
+
+Then point the app at it — in **Settings → Translate**:
+
+| Field | Value |
+| :-- | :-- |
+| Engine | `LibreTranslate` |
+| LibreTranslate link | `http://localhost:5000` |
+| API key | leave empty (a local instance needs none) |
+
+The *"LibreTranslate API key is not set"* warning is expected with a local server; tick **Supress Empty API Key** in the same tab to silence it.
+
+### Running
+
+```bash
+docker start libretranslate   # ~15s until it answers
+run-app.bat                   # or: .venv\Scripts\python.exe Run.py
+```
+
+Check the server is up with `curl http://localhost:5000/languages`.
+
+### Note on Whisper as the translation engine
+
+Picking a Whisper model in the *Translate* dropdown runs translation locally with no API at all — but Whisper only translates **into English** (`WHISPER_TARGET = ["English"]`). For any other target language an external engine is required, which is what this setup provides locally.
+
+### Changes in this fork
+
+- Translation requests are rate limited and back off exponentially on rejection, with finished sentences requeued instead of dropped; local engines are exempt from the throttle
+- A stream that breaks mid frame (a Bluetooth endpoint being reconfigured, for instance) no longer aborts the recording session with a reshape error
+- The Silero/auto-threshold disable handlers no longer raise `TclError` over a destroyed widget, which used to mask the original error
+
+---
+
 <p align="center">
   <img src="preview/1.png" width="700" alt="Speech Translate Preview">
 </p>
