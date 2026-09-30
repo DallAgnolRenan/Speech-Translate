@@ -182,8 +182,9 @@ def to_silero(sound_bytes: bytes, num_of_channels: int, samp_width: int = 2):
 
         audio_as_np_int16 = frombuffer(audio_bytes, dtype=int16).flatten()
         audio_as_np_float32 = audio_as_np_int16.astype(float32)
-        chunk_length = len(audio_as_np_float32) / num_of_channels
-        audio_reshaped = reshape(audio_as_np_float32, (int(chunk_length), num_of_channels))
+        # drop any trailing partial frame, which a stream that breaks mid frame can leave behind
+        chunk_length = len(audio_as_np_float32) // num_of_channels
+        audio_reshaped = reshape(audio_as_np_float32[:chunk_length * num_of_channels], (chunk_length, num_of_channels))
         np_buf = audio_reshaped[:, 0] / iinfo(int16).max  # take left channel only
 
     torch_float32 = torch.from_numpy(np_buf.squeeze())

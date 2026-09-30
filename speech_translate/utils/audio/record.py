@@ -8,7 +8,7 @@ from queue import Empty, Queue
 from shlex import quote
 from threading import Lock, Thread
 from time import gmtime, sleep, strftime, time
-from tkinter import IntVar, Toplevel, ttk
+from tkinter import IntVar, TclError, Toplevel, ttk
 from wave import Wave_write
 from wave import open as w_open
 
@@ -49,6 +49,19 @@ ERROR_CON_NOTIFIED = False
 ERROR_CON_NOFIFIED_AMOUNT = 0
 
 FREEZE_PUNCTUATIONS = (".", "?", "!", "。", "？", "！")
+
+# tl_api outcomes, so the worker can tell a rate limit apart from any other failure
+TL_OK = "ok"
+TL_RATE_LIMITED = "rate_limited"
+TL_ERROR = "error"
+
+# google allows 5 req/s; stay under it and back off when it complains anyway
+TL_MIN_INTERVAL_S = 1 / 3
+TL_BACKOFF_START_S = 2.0
+TL_BACKOFF_MAX_S = 30.0
+TL_MAX_REQUEUE = 20
+# a self hosted engine has no quota to respect, so do not slow it down to the public api pace
+TL_UNTHROTTLED_ENGINES = ("LibreTranslate", )
 
 
 def get_freeze_cut(result, real_duration: float, min_buffer_s: float = 3.0, margin_s: float = 0.5):
@@ -581,24 +594,32 @@ def record_session(
             Disable silero when not possible to use it
             """
             global silero_disabled
-            if cbtn_enable_silero.instate(["selected"]):
-                cbtn_enable_silero.invoke()
             silero_disabled = True
-            cbtn_enable_silero.configure(state="disabled")
-            tooltip_cbtn_silero.text = "Silero VAD is unavailable on this current " \
-                                    "device configuration (check log for details)"
+            # the modal may already be gone when this runs from the audio callback, so the widget
+            # calls below would raise TclError and mask the error that got us here
+            try:
+                if cbtn_enable_silero.instate(["selected"]):
+                    cbtn_enable_silero.invoke()
+                cbtn_enable_silero.configure(state="disabled")
+                tooltip_cbtn_silero.text = "Silero VAD is unavailable on this current " \
+                                        "device configuration (check log for details)"
+            except TclError:
+                logger.debug("Recording modal already destroyed, skipping silero checkbutton update")
 
         def disable_auto_threshold():  # pylint: disable=unused-variable
             """
             Disable auto threshold when not possible to use it
             """
-            if cbtn_auto_threshold.instate(["selected"]):
-                cbtn_auto_threshold.invoke()
-            cbtn_auto_threshold.configure(state="disabled")
-            tk_tooltip(
-                cbtn_auto_threshold,
-                "Auto threshold is unavailable on this current device configuration (check log for details)"
-            )
+            try:
+                if cbtn_auto_threshold.instate(["selected"]):
+                    cbtn_auto_threshold.invoke()
+                cbtn_auto_threshold.configure(state="disabled")
+                tk_tooltip(
+                    cbtn_auto_threshold,
+                    "Auto threshold is unavailable on this current device configuration (check log for details)"
+                )
+            except TclError:
+                logger.debug("Recording modal already destroyed, skipping auto threshold checkbutton update")
             disable_silerovad()
 
         def update_status_lbl():
@@ -699,6 +720,9 @@ def record_session(
                 sleep(0.01)
 
         def tl_api_worker():
+            last_call = 0.0
+            backoff_until = 0.0
+            backoff_s = TL_BACKOFF_START_S
             while bc.recording:
                 try:
                     items = [tl_queue.get(timeout=0.1)]
@@ -716,11 +740,49 @@ def record_session(
                 process = finals + lives[-1:]
 
                 try:
-                    for it in process:
+                    # while backing off, drop the live partials and keep only the finals, so the
+                    # queue does not pile up work that is stale by the time the api lets us back in
+                    if time() < backoff_until:
+                        process = finals
+
+                    for idx, it in enumerate(process):
+                        if not bc.recording:
+                            break
+
+                        min_interval = 0.0 if it[3] in TL_UNTHROTTLED_ENGINES else TL_MIN_INTERVAL_S
+
+                        # sleep in slices so that stopping the recording does not have to wait out
+                        # a long backoff before the thread notices
+                        while bc.recording:
+                            wait = max(backoff_until - time(), last_call + min_interval - time())
+                            if wait <= 0:
+                                break
+                            sleep(min(wait, 0.2))
+                        if not bc.recording:
+                            break
+
+                        last_call = time()
                         try:
-                            tl_api(*it)
+                            outcome = tl_api(*it)
                         except Exception as e:
                             logger.exception(e)
+                            outcome = TL_ERROR
+
+                        if outcome == TL_RATE_LIMITED:
+                            backoff_until = time() + backoff_s
+                            logger.warning(f"Translation rate limited, backing off for {backoff_s:.0f}s")
+                            backoff_s = min(backoff_s * 2, TL_BACKOFF_MAX_S)
+                            # put the finished sentences we did not get to back on the queue so they
+                            # are translated after the backoff instead of leaving holes, but cap it
+                            # so a long outage cannot grow the queue without bound
+                            requeue = [nxt for nxt in process[idx:] if nxt[5]][:TL_MAX_REQUEUE]
+                            for nxt in requeue:
+                                tl_enqueue(nxt)
+                            if requeue:
+                                logger.debug(f"Requeued {len(requeue)} finished sentence(s) for after the backoff")
+                            break
+                        if outcome == TL_OK:
+                            backoff_s = TL_BACKOFF_START_S
                 finally:
                     with tl_outstanding_lock:
                         tl_outstanding[0] -= len(items)
@@ -819,8 +881,12 @@ def record_session(
                     # Samples are interleaved, so for a stereo stream with left channel
                     # of [L0, L1, L2, ...] and right channel of [R0, R1, R2, ...]
                     # the output is ordered as [[L0, R0], [L1, R1], [L2, R2], ...
-                    chunk_length = len(audio_as_np_float32) / num_of_channels
-                    audio_reshaped = np.reshape(audio_as_np_float32, (int(chunk_length), num_of_channels))
+                    # a stream that breaks mid frame (a bluetooth endpoint being reconfigured, for
+                    # example) hands us a trailing partial frame, so drop it instead of failing
+                    chunk_length = len(audio_as_np_float32) // num_of_channels
+                    audio_reshaped = np.reshape(
+                        audio_as_np_float32[:chunk_length * num_of_channels], (chunk_length, num_of_channels)
+                    )
                     audio_np = audio_reshaped[:, 0] / max_int16  # take left channel only
                     if whisper_args["demucs"]:
                         audio_target = torch.from_numpy(audio_np).to(cuda_device)  # convert to torch tensor
@@ -1199,11 +1265,17 @@ def tl_api(text: str, lang_source: str, lang_target: str, engine: str, separator
             else:
                 prev_tl_res = result.strip()
                 bc.update_tl(result.strip(), separator)
+        return TL_OK
     except Exception as e:
-        logger.exception(e)
+        rate_limited = "too many requests" in str(e).lower()
+        if not rate_limited:
+            # a rate limit is expected under continuous speech and the worker backs off on it,
+            # so keep it out of the log instead of burying real failures under thousands of lines
+            logger.exception(e)
         global ERROR_CON_NOTIFIED, ERROR_CON_NOFIFIED_AMOUNT
         if not ERROR_CON_NOTIFIED:
             native_notify(f"Error: translation with {engine} failed", str(e))
             ERROR_CON_NOFIFIED_AMOUNT += 1
             if ERROR_CON_NOFIFIED_AMOUNT > 3:  # after 3 times, stop notifying
                 ERROR_CON_NOTIFIED = True
+        return TL_RATE_LIMITED if rate_limited else TL_ERROR
