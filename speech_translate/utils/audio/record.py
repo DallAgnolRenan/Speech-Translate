@@ -91,6 +91,16 @@ TL_TRANSIENT_BACKOFF_MAX_S = 5.0
 TL_DRAIN_S = 6.0
 # a self hosted engine has no quota to respect, so do not slow it down to the public api pace
 TL_UNTHROTTLED_ENGINES = ("LibreTranslate", )
+# after this many failures in a row the engine is treated as down rather than flaky. retrying every
+# sentence against a dead engine costs a request timeout each (5s for LibreTranslate), which is
+# slower than speech arrives: the worker falls behind, the queue grows and the log fills with
+# identical stack traces. instead it sends one sentence per probe interval to find out when the
+# engine answers again, and reports the outage on the recording modal.
+# two is deliberately low: a failure costs a full request timeout, so waiting for a third would
+# leave the pane dead and unexplained for the better part of twenty seconds. a false positive is
+# cheap, the next probe clears it
+TL_OUTAGE_AFTER = 2
+TL_PROBE_INTERVAL_S = 5.0
 
 
 def get_freeze_cut(result, real_duration: float, min_buffer_s: float = 3.0, margin_s: float = 0.5):
@@ -166,6 +176,8 @@ def record_session(
 
         ERROR_CON_NOTIFIED = False
         ERROR_CON_NOFIFIED_AMOUNT = 0
+        bc.tl_outage = False
+        bc.tl_skipped = 0
         p = pyaudio.PyAudio()
         success, detail = get_device_details(rec_type, sj, p)
 
@@ -655,7 +667,13 @@ def record_session(
             disable_silerovad()
 
         def update_status_lbl():
-            lbl_status.configure(text=bc.current_rec_status)
+            status = bc.current_rec_status
+            # the recording thread rewrites current_rec_status every pass, so the outage is
+            # appended here rather than set there. without it a dead engine looks exactly like
+            # a quiet room: the transcript keeps scrolling and the translation just stops
+            if bc.tl_outage:
+                status += f" | ⚠️ {engine} not answering ({bc.tl_skipped} skipped)"
+            lbl_status.configure(text=status)
 
         def update_modal_ui():
             nonlocal t_start, paused
@@ -760,11 +778,27 @@ def record_session(
         def tl_worker_active():
             return bc.recording or (tl_outstanding[0] > 0 and time() < tl_drain_until[0])
 
+        def tl_requeue(pending):
+            """Put sentences we could not get to back on the queue, so a pause leaves no holes.
+
+            Capped, and the cap keeps the newest: an engine that is down for minutes would
+            otherwise build a backlog the conversation has long moved past, and the user would
+            watch it replay old text instead of following what is being said now.
+            """
+            keep = [nxt for nxt in pending if nxt[5]]
+            if len(keep) > TL_MAX_REQUEUE:
+                bc.tl_skipped += len(keep) - TL_MAX_REQUEUE
+                keep = keep[-TL_MAX_REQUEUE:]
+            for nxt in keep:
+                tl_enqueue(nxt)
+            return len(keep)
+
         def tl_api_worker():
             last_call = 0.0
             backoff_until = 0.0
             backoff_s = TL_BACKOFF_START_S
             transient_backoff_s = TL_TRANSIENT_BACKOFF_S
+            consecutive_fails = 0
             while tl_worker_active():
                 try:
                     items = [tl_queue.get(timeout=0.1)]
@@ -787,6 +821,14 @@ def record_session(
                     # same once recording stopped: a partial has nothing left to grow into
                     if time() < backoff_until or not bc.recording:
                         process = finals
+
+                    # with the engine down, one sentence per probe interval is all it takes to
+                    # learn when it answers again. the rest wait on the queue instead of each
+                    # costing a request timeout against something that is not listening
+                    deferred = []
+                    if bc.tl_outage and len(process) > 1:
+                        deferred = process[1:]
+                        process = process[:1]
 
                     for idx, it in enumerate(process):
                         if not tl_worker_active():
@@ -812,27 +854,44 @@ def record_session(
                             outcome = TL_ERROR
 
                         if outcome in (TL_RATE_LIMITED, TL_TRANSIENT):
+                            consecutive_fails += 1
+                            if consecutive_fails == TL_OUTAGE_AFTER and not bc.tl_outage:
+                                bc.tl_outage = True
+                                logger.error(
+                                    f"{it[3]} failed {consecutive_fails} times in a row, treating it as down. "
+                                    f"Retrying one sentence every {TL_PROBE_INTERVAL_S:.0f}s until it answers"
+                                )
                             if outcome == TL_RATE_LIMITED:
                                 pause, backoff_s = backoff_s, min(backoff_s * 2, TL_BACKOFF_MAX_S)
                                 logger.warning(f"Translation rate limited, backing off for {pause:.0f}s")
                             else:
                                 pause = transient_backoff_s
                                 transient_backoff_s = min(transient_backoff_s * 2, TL_TRANSIENT_BACKOFF_MAX_S)
+                            if bc.tl_outage:
+                                pause = max(pause, TL_PROBE_INTERVAL_S)
                             backoff_until = time() + pause
 
-                            # put the sentences we did not get to back on the queue so they are
-                            # translated after the pause instead of leaving holes, but cap it so a
-                            # long outage cannot grow the queue without bound. the one that just
-                            # failed is included: it was never translated
-                            requeue = [nxt for nxt in process[idx:] if nxt[5]][:TL_MAX_REQUEUE]
-                            for nxt in requeue:
-                                tl_enqueue(nxt)
-                            if requeue:
-                                logger.debug(f"Requeued {len(requeue)} finished sentence(s) for after the pause")
+                            # the one that just failed is included: it was never translated
+                            requeued = tl_requeue(process[idx:] + deferred)
+                            if requeued:
+                                logger.debug(f"Requeued {requeued} finished sentence(s) for after the pause")
+                            deferred = []
                             break
                         if outcome == TL_OK:
+                            if bc.tl_outage:
+                                bc.tl_outage = False
+                                logger.info(
+                                    f"{it[3]} is answering again, resuming "
+                                    f"({bc.tl_skipped} sentence(s) went untranslated while it was down)"
+                                )
+                            consecutive_fails = 0
                             backoff_s = TL_BACKOFF_START_S
                             transient_backoff_s = TL_TRANSIENT_BACKOFF_S
+
+                    # the probe got through, or there was nothing to probe with: whatever was
+                    # held back goes to the front of the next round instead of being dropped
+                    if deferred:
+                        tl_requeue(deferred)
                 finally:
                     with tl_outstanding_lock:
                         tl_outstanding[0] -= len(items)
@@ -862,7 +921,10 @@ def record_session(
                 if len(bc.tc_sentences) > 0:
                     bc.update_tc(None, separator)
             if is_tl:
-                if not tl_engine_whisper:
+                # wait for the worker so the sentence about to be closed carries its translation.
+                # not while the engine is down though: the queue never drains then, so this would
+                # stall the recording thread for the full timeout on every single buffer break
+                if not tl_engine_whisper and not bc.tl_outage:
                     tl_flush()
                 with bc.tl_res_lock:
                     pending_tl = prev_tl_res

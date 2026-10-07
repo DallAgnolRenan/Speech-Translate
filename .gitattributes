@@ -1,0 +1,4 @@
+# the docker build copies these into a linux image, where a CR at the end of a line
+# becomes part of the command
+Dockerfile text eol=lf
+*.yml text eol=lf

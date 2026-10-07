@@ -34,16 +34,18 @@ Transcription was never affected — Whisper always runs locally on the GPU.
 Start the translation server once:
 
 ```bash
-docker run -d --name libretranslate --restart unless-stopped -p 5000:5000 \
-  -v libretranslate_models:/home/libretranslate/.local/share/argos-translate \
-  libretranslate/libretranslate:latest \
-  --load-only en,pt --threads 2 --translation-cache all --disable-web-ui
+docker compose up -d --build
 ```
+
+`docker-compose.yml` builds a thin layer over the official image. What it passes:
 
 - `--load-only en,pt` keeps only the language pair in use (adjust to your languages)
 - `--threads 2` avoids the default 4 gunicorn workers competing to load the model, which made them hit `WORKER TIMEOUT` and restart in a loop, so the first request never completed
 - `--translation-cache all` matters in live mode, where the same partial sentence is re-translated as it grows
+- `LT_TIMEOUT=60` replaces the stock 2400s, so a wedged worker costs a minute instead of forty
 - the named volume keeps the ~159MB of language models across container recreations
+
+**Why a derived image instead of plain `docker run`.** The official entrypoint starts gunicorn with `--max-requests 250`, recycling each worker once it has served 250 requests. That worker then never exits: it blocks on a futex, holding a lock the native translation libraries left behind in the child at fork time. The container still reads `Up` and the port still accepts connections, but nothing answers, and the arbiter only replaces the process once `--timeout` expires — 2400s by default. Live transcription burns through 250 requests in minutes, so the translation pane would go dead, come back for about ninety seconds while the fresh workers drained the backlog, and go dead again. The Dockerfile drops `--max-requests`; `LT_TIMEOUT` is the safety net in case anything else ever wedges a worker.
 
 Then point the app at it — in **Settings → Translate**:
 
@@ -58,11 +60,13 @@ The *"LibreTranslate API key is not set"* warning is expected with a local serve
 ### Running
 
 ```bash
-docker start libretranslate   # ~15s until it answers
+docker compose up -d          # ~15s until it answers
 run-app.bat                   # or: .venv\Scripts\python.exe Run.py
 ```
 
-Check the server is up with `curl http://localhost:5000/languages`.
+Check it with `docker compose ps`: the healthcheck calls `/languages`, which only answers when a worker is actually alive, so `healthy` tells you more here than `Up` does.
+
+If the engine goes down mid-session the app no longer fails silently. After two failures in a row it says so on the recording modal (`⚠️ LibreTranslate not answering (N skipped)`), stops spending a request timeout on every sentence, and resumes on its own once the engine answers again.
 
 ### Note on Whisper as the translation engine
 
@@ -71,6 +75,13 @@ Picking a Whisper model in the *Translate* dropdown runs translation locally wit
 ### Changes in this fork
 
 - Translation requests are rate limited and back off exponentially on rejection, with finished sentences requeued instead of dropped; local engines are exempt from the throttle
+- An engine that stops answering is detected after two consecutive failures and reported on the recording modal, rather than leaving the translation pane to go quiet with no explanation. While it is down the worker probes once every few seconds instead of spending a request timeout per sentence, and recovers by itself
+- The recording thread no longer waits on the translation queue during an outage. That wait is capped at 3s per buffer break, and in a 92 minute session against a dead engine it added up to 39 minutes of stalled recording — it degraded the transcript, not just the translation
+- Network failures from LibreTranslate log one line instead of a full stack trace. One outage wrote 1,716 tracebacks and 8.7MB of log, which buries anything real
+- Stopping a recording drains the pending translations instead of discarding them, bounded so a dead engine cannot hold the stop button hostage
+- A live partial that finishes translating after its sentence was already closed is dropped instead of overwriting the current text
+- `bc.tl_sentences` is trimmed to the session's sentence cap, like the transcript pane already was
+- The saved audio device is looked up by name when its index no longer matches, so pairing a Bluetooth headset does not silently shift the recording to a different device
 - A stream that breaks mid frame (a Bluetooth endpoint being reconfigured, for instance) no longer aborts the recording session with a reshape error
 - The Silero/auto-threshold disable handlers no longer raise `TclError` over a destroyed widget, which used to mask the original error
 

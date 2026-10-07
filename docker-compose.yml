@@ -1,0 +1,38 @@
+# Self-hosted translation backend for the realtime EN -> PT flow.
+#
+#   docker compose up -d --build     start it (first build takes a minute, then it is cached)
+#   docker compose logs -f           follow it
+#   docker compose down              stop it
+#
+# The models live in the external named volume so rebuilding never re-downloads them.
+services:
+  libretranslate:
+    build: ./docker/libretranslate
+    image: speech-translate/libretranslate:no-recycle
+    container_name: libretranslate
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      # safety net: the stock image waits 2400s before replacing a wedged worker, which is
+      # 40 minutes of silent downtime. One minute is plenty for a local translation request.
+      LT_TIMEOUT: "60"
+    command:
+      - --load-only=en,pt          # only the pair we use, so boot stays fast
+      - --threads=2                # LibreTranslate maps this to gunicorn --workers
+      - --translation-cache=all    # repeated phrases come back without hitting the model
+      - --disable-web-ui
+    volumes:
+      - libretranslate_models:/home/libretranslate/.local/share/argos-translate
+    healthcheck:
+      # /languages is cheap and, unlike a plain port check, it only answers when a worker is
+      # actually alive -- exactly the failure this setup exists to catch.
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:5000/languages',timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+volumes:
+  libretranslate_models:
+    external: true

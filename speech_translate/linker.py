@@ -102,6 +102,11 @@ class BridgeClass:
         # pending result, which lets the worker tell its answer is for text already superseded
         self.tl_res_lock: Lock = Lock()
         self.tl_epoch: int = 0
+        # set by the translation worker once the engine has failed enough times in a row to call it
+        # down. the recording modal reads it so the user sees why the translation pane went quiet
+        # instead of having to guess, and tl_skipped counts what was dropped while it was down
+        self.tl_outage: bool = False
+        self.tl_skipped: int = 0
 
         # file process
         self.file_tced_counter: int = 0

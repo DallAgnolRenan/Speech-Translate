@@ -303,7 +303,14 @@ def libre_tl(
         is_success = True
     except Exception as e:
         result = str(e)
-        logger.exception(e)
+        # the caller retries network failures and already logs a line for each, so a full stack
+        # trace here says nothing new. under live input it says it thousands of times: an engine
+        # that stays down for an hour wrote 1.7k tracebacks and 8MB of log, and rendering them
+        # (loguru resolves every local in every frame) competes with transcription for the cpu
+        if isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            logger.debug(f"LibreTranslate request failed: {e}")
+        else:
+            logger.exception(e)
         if "NewConnectionError" in str(e):
             result = "Error: Could not connect. Please make sure that the server is running and the port is correct." \
             " If you are not hosting it yourself, please try again with an internet connection."
