@@ -49,7 +49,52 @@ def get_device_details(device_type: Literal["speaker", "mic"], sj, p: pyaudio.Py
         device_index = device_id.split(",")[0]
         host_index = device_id.split(",")[1]
 
-        device_detail = p.get_device_info_by_host_api_device_index(int(device_index), int(host_index))
+        # the saved string carries the name too, after the "] | " separator
+        saved_name = device.split("] | ", 1)[1].strip() if "] | " in device else ""
+        # note: despite their names, device_index holds the host api and host_index the device
+        # within it, matching the "[ID: {host},{device}]" the device lists are built with
+        api_idx = int(device_index)
+
+        def find_by_name():
+            """Scan the host api for the saved name. MME truncates names to 31 chars, so the
+            comparison is on that prefix."""
+            host_info = p.get_host_api_info_by_index(api_idx)
+            wanted_io = "maxInputChannels" if device_type == "mic" else "maxOutputChannels"
+            for j in range(int(host_info["deviceCount"])):
+                candidate = p.get_device_info_by_host_api_device_index(api_idx, j)
+                if int(candidate[wanted_io]) > 0 and str(candidate["name"]).startswith(saved_name[:31]):
+                    logger.info(f"Found '{candidate['name']}' at index {api_idx},{j}")
+                    return candidate
+            return None
+
+        # the index is positional: plugging in or removing a device (a bluetooth headset pairing,
+        # say) shifts everything after it, so the saved index can point at a different device
+        # entirely, or past the end of the list. trust the name over the index
+        try:
+            device_detail = p.get_device_info_by_host_api_device_index(api_idx, int(host_index))
+            stale = bool(saved_name) and not str(device_detail["name"]).startswith(saved_name[:31])
+            if stale:
+                logger.warning(
+                    f"Device at index {api_idx},{host_index} is now '{device_detail['name']}', "
+                    f"expected '{saved_name}'. Looking it up by name instead."
+                )
+        except Exception:  # pylint: disable=broad-except
+            if not saved_name:
+                raise
+            logger.warning(f"Index {api_idx},{host_index} is gone. Looking '{saved_name}' up by name instead.")
+            device_detail, stale = None, True
+
+        if stale:
+            device_detail = find_by_name()
+            if device_detail is None:
+                logger.error(f"Device '{saved_name}' is no longer available on this host api")
+                return False, {
+                    "device_detail": {},
+                    "chunk_size": 0,
+                    "sample_rate": 0,
+                    "num_of_channels": 0,
+                }
+
         if device_type == "speaker":
             # device_detail = p.get_wasapi_loopback_analogue_by_dict(device_detail)
             if not device_detail["isLoopbackDevice"]:
