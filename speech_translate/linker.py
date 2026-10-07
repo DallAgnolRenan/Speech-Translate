@@ -93,6 +93,10 @@ class BridgeClass:
         self.tc_lock: Optional[Lock] = None
         self.tc_sentences: List = []
         self.tl_sentences: List = []
+        # sentence cap of the running session, so tl_api can trim tl_sentences the same way the
+        # recording thread trims tc_sentences. set when a recording session starts
+        self.max_sentences: int = 5
+        self.sentence_limitless: bool = False
 
         # file process
         self.file_tced_counter: int = 0

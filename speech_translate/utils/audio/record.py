@@ -50,16 +50,41 @@ ERROR_CON_NOFIFIED_AMOUNT = 0
 
 FREEZE_PUNCTUATIONS = (".", "?", "!", "。", "？", "！")
 
-# tl_api outcomes, so the worker can tell a rate limit apart from any other failure
+# tl_api outcomes, so the worker can tell apart a rate limit, a blip worth retrying,
+# and a failure that would fail again no matter how long we wait
 TL_OK = "ok"
 TL_RATE_LIMITED = "rate_limited"
+TL_TRANSIENT = "transient"
 TL_ERROR = "error"
+
+# the engine is momentarily unreachable, busy or restarting: a short pause is enough. matched
+# against the error text because translate() flattens the exception into a string, and for some
+# cases replaces it with a message of its own (see libre_tl), so both forms are listed here
+TL_TRANSIENT_MARKERS = (
+    # raw exception text
+    "timed out",
+    "timeout",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "failed to establish a new connection",
+    "max retries exceeded",
+    "remotedisconnected",
+    "bad gateway",
+    "service unavailable",
+    # messages translator.py substitutes for the exception
+    "could not connect",
+    "not connected to internet",
+)
 
 # google allows 5 req/s; stay under it and back off when it complains anyway
 TL_MIN_INTERVAL_S = 1 / 3
 TL_BACKOFF_START_S = 2.0
 TL_BACKOFF_MAX_S = 30.0
 TL_MAX_REQUEUE = 20
+# a blip clears in seconds, so retry sooner than for a quota that may last minutes
+TL_TRANSIENT_BACKOFF_S = 0.5
+TL_TRANSIENT_BACKOFF_MAX_S = 5.0
 # a self hosted engine has no quota to respect, so do not slow it down to the public api pace
 TL_UNTHROTTLED_ENGINES = ("LibreTranslate", )
 
@@ -151,6 +176,9 @@ def record_session(
         max_buffer_s = int(sj.cache.get(f"max_buffer_{rec_type}", 10))
         max_sentences = int(sj.cache.get(f"max_sentences_{rec_type}", 5))
         sentence_limitless = sj.cache.get(f"{rec_type}_no_limit", False)
+        # tl_api runs on the worker thread and cannot see these locals
+        bc.max_sentences = max_sentences
+        bc.sentence_limitless = sentence_limitless
         tl_engine_whisper = engine in model_values
         segment_freeze = sj.cache.get("realtime_segment_freeze", True) and not (is_tl and tl_engine_whisper)
 
@@ -723,6 +751,7 @@ def record_session(
             last_call = 0.0
             backoff_until = 0.0
             backoff_s = TL_BACKOFF_START_S
+            transient_backoff_s = TL_TRANSIENT_BACKOFF_S
             while bc.recording:
                 try:
                     items = [tl_queue.get(timeout=0.1)]
@@ -768,21 +797,28 @@ def record_session(
                             logger.exception(e)
                             outcome = TL_ERROR
 
-                        if outcome == TL_RATE_LIMITED:
-                            backoff_until = time() + backoff_s
-                            logger.warning(f"Translation rate limited, backing off for {backoff_s:.0f}s")
-                            backoff_s = min(backoff_s * 2, TL_BACKOFF_MAX_S)
-                            # put the finished sentences we did not get to back on the queue so they
-                            # are translated after the backoff instead of leaving holes, but cap it
-                            # so a long outage cannot grow the queue without bound
+                        if outcome in (TL_RATE_LIMITED, TL_TRANSIENT):
+                            if outcome == TL_RATE_LIMITED:
+                                pause, backoff_s = backoff_s, min(backoff_s * 2, TL_BACKOFF_MAX_S)
+                                logger.warning(f"Translation rate limited, backing off for {pause:.0f}s")
+                            else:
+                                pause = transient_backoff_s
+                                transient_backoff_s = min(transient_backoff_s * 2, TL_TRANSIENT_BACKOFF_MAX_S)
+                            backoff_until = time() + pause
+
+                            # put the sentences we did not get to back on the queue so they are
+                            # translated after the pause instead of leaving holes, but cap it so a
+                            # long outage cannot grow the queue without bound. the one that just
+                            # failed is included: it was never translated
                             requeue = [nxt for nxt in process[idx:] if nxt[5]][:TL_MAX_REQUEUE]
                             for nxt in requeue:
                                 tl_enqueue(nxt)
                             if requeue:
-                                logger.debug(f"Requeued {len(requeue)} finished sentence(s) for after the backoff")
+                                logger.debug(f"Requeued {len(requeue)} finished sentence(s) for after the pause")
                             break
                         if outcome == TL_OK:
                             backoff_s = TL_BACKOFF_START_S
+                            transient_backoff_s = TL_TRANSIENT_BACKOFF_S
                 finally:
                     with tl_outstanding_lock:
                         tl_outstanding[0] -= len(items)
@@ -1261,21 +1297,33 @@ def tl_api(text: str, lang_source: str, lang_target: str, engine: str, separator
             if final:
                 bc.tl_sentences.append(result.strip())
                 bc.tl_sentences = unique_rec_list(bc.tl_sentences)
+                # trim like the recording thread trims tc_sentences, otherwise this list grows for
+                # the whole session and the two panes drift apart
+                if not bc.sentence_limitless and len(bc.tl_sentences) > bc.max_sentences:
+                    del bc.tl_sentences[:len(bc.tl_sentences) - bc.max_sentences]
                 bc.update_tl(None, separator)
             else:
                 prev_tl_res = result.strip()
                 bc.update_tl(result.strip(), separator)
         return TL_OK
     except Exception as e:
-        rate_limited = "too many requests" in str(e).lower()
-        if not rate_limited:
-            # a rate limit is expected under continuous speech and the worker backs off on it,
-            # so keep it out of the log instead of burying real failures under thousands of lines
+        msg = str(e).lower()
+        rate_limited = "too many requests" in msg
+        transient = not rate_limited and any(marker in msg for marker in TL_TRANSIENT_MARKERS)
+        if not rate_limited and not transient:
+            # a rate limit or a blip is expected under continuous speech and the worker retries
+            # both, so keep them out of the log instead of burying real failures under thousands
+            # of lines
             logger.exception(e)
+        elif transient:
+            logger.warning(f"Translation attempt failed, will retry: {e}")
         global ERROR_CON_NOTIFIED, ERROR_CON_NOFIFIED_AMOUNT
-        if not ERROR_CON_NOTIFIED:
+        # a blip is retried transparently, so do not alarm the user about it
+        if not ERROR_CON_NOTIFIED and not transient:
             native_notify(f"Error: translation with {engine} failed", str(e))
             ERROR_CON_NOFIFIED_AMOUNT += 1
             if ERROR_CON_NOFIFIED_AMOUNT > 3:  # after 3 times, stop notifying
                 ERROR_CON_NOTIFIED = True
-        return TL_RATE_LIMITED if rate_limited else TL_ERROR
+        if rate_limited:
+            return TL_RATE_LIMITED
+        return TL_TRANSIENT if transient else TL_ERROR
