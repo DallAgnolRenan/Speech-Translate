@@ -97,6 +97,11 @@ class BridgeClass:
         # recording thread trims tc_sentences. set when a recording session starts
         self.max_sentences: int = 5
         self.sentence_limitless: bool = False
+        # prev_tl_res is written by the translation worker and read by the recording thread, so
+        # both go through this lock. tl_epoch rises whenever the recording thread clears the
+        # pending result, which lets the worker tell its answer is for text already superseded
+        self.tl_res_lock: Lock = Lock()
+        self.tl_epoch: int = 0
 
         # file process
         self.file_tced_counter: int = 0

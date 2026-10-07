@@ -9,6 +9,7 @@ from shlex import quote
 from threading import Lock, Thread
 from time import gmtime, sleep, strftime, time
 from tkinter import IntVar, TclError, Toplevel, ttk
+from typing import Optional
 from wave import Wave_write
 from wave import open as w_open
 
@@ -85,6 +86,9 @@ TL_MAX_REQUEUE = 20
 # a blip clears in seconds, so retry sooner than for a quota that may last minutes
 TL_TRANSIENT_BACKOFF_S = 0.5
 TL_TRANSIENT_BACKOFF_MAX_S = 5.0
+# how long stopping a recording waits for the sentences still queued to be translated. bounded so
+# that an engine which is down cannot hold the stop button hostage
+TL_DRAIN_S = 6.0
 # a self hosted engine has no quota to respect, so do not slow it down to the public api pace
 TL_UNTHROTTLED_ENGINES = ("LibreTranslate", )
 
@@ -709,7 +713,9 @@ def record_session(
         bc.tl_sentences = []
         temp_list = []
         prev_tc_res = ""
-        prev_tl_res = ""
+        with bc.tl_res_lock:
+            prev_tl_res = ""
+            bc.tl_epoch += 1
         next_transcribe_time = None
         last_sample = bytes()
         samp_width = p.get_sample_size(pyaudio.paInt16)
@@ -747,12 +753,19 @@ def record_session(
             while tl_outstanding[0] > 0 and time() < deadline:
                 sleep(0.01)
 
+        # while this is in the future the worker keeps going after recording stopped, so the
+        # sentences still queued when the user hits stop get translated instead of thrown away
+        tl_drain_until = [0.0]
+
+        def tl_worker_active():
+            return bc.recording or (tl_outstanding[0] > 0 and time() < tl_drain_until[0])
+
         def tl_api_worker():
             last_call = 0.0
             backoff_until = 0.0
             backoff_s = TL_BACKOFF_START_S
             transient_backoff_s = TL_TRANSIENT_BACKOFF_S
-            while bc.recording:
+            while tl_worker_active():
                 try:
                     items = [tl_queue.get(timeout=0.1)]
                 except Empty:
@@ -770,24 +783,25 @@ def record_session(
 
                 try:
                     # while backing off, drop the live partials and keep only the finals, so the
-                    # queue does not pile up work that is stale by the time the api lets us back in
-                    if time() < backoff_until:
+                    # queue does not pile up work that is stale by the time the api lets us back in.
+                    # same once recording stopped: a partial has nothing left to grow into
+                    if time() < backoff_until or not bc.recording:
                         process = finals
 
                     for idx, it in enumerate(process):
-                        if not bc.recording:
+                        if not tl_worker_active():
                             break
 
                         min_interval = 0.0 if it[3] in TL_UNTHROTTLED_ENGINES else TL_MIN_INTERVAL_S
 
                         # sleep in slices so that stopping the recording does not have to wait out
                         # a long backoff before the thread notices
-                        while bc.recording:
+                        while tl_worker_active():
                             wait = max(backoff_until - time(), last_call + min_interval - time())
                             if wait <= 0:
                                 break
                             sleep(min(wait, 0.2))
-                        if not bc.recording:
+                        if not tl_worker_active():
                             break
 
                         last_call = time()
@@ -850,8 +864,10 @@ def record_session(
             if is_tl:
                 if not tl_engine_whisper:
                     tl_flush()
-                if prev_tl_res:
-                    bc.tl_sentences.append(prev_tl_res)
+                with bc.tl_res_lock:
+                    pending_tl = prev_tl_res
+                if pending_tl:
+                    bc.tl_sentences.append(pending_tl)
                 bc.tl_sentences = unique_rec_list(bc.tl_sentences)
                 if not sentence_limitless and len(bc.tl_sentences) > max_sentences:
                     bc.tl_sentences.pop(0)
@@ -1054,10 +1070,15 @@ def record_session(
 
                         if is_tl:
                             bc.current_rec_status = "▶️ Recording ⟳ Translating text"
-                            prev_tl_res = ""
-                            tl_enqueue((frozen_text, lang_source, lang_target, engine, separator, True))
+                            # bump the epoch so any live translation still in flight for the text
+                            # we just froze is discarded instead of overwriting the next one
+                            with bc.tl_res_lock:
+                                prev_tl_res = ""
+                                bc.tl_epoch += 1
+                                epoch = bc.tl_epoch
+                            tl_enqueue((frozen_text, lang_source, lang_target, engine, separator, True, epoch))
                             if tail_text:
-                                tl_enqueue((tail_text, lang_source, lang_target, engine, separator, False))
+                                tl_enqueue((tail_text, lang_source, lang_target, engine, separator, False, epoch))
                     else:
                         prev_tc_res = result
                         bc.update_tc(result, separator)
@@ -1074,7 +1095,9 @@ def record_session(
                                 bc.rec_tl_thread.start()
                                 bc.rec_tl_thread.join()
                             else:
-                                tl_enqueue((text, lang_source, lang_target, engine, separator, False))
+                                with bc.tl_res_lock:
+                                    epoch = bc.tl_epoch
+                                tl_enqueue((text, lang_source, lang_target, engine, separator, False, epoch))
 
             if use_temp and not sj.cache["keep_temp"]:
                 os.remove(audio_target)  # type: ignore
@@ -1088,6 +1111,23 @@ def record_session(
 
         # ----------------- End recording -----------------
         logger.debug("Stopping Record Session")
+
+        # recording stopped, but sentences may still be queued for translation. give the worker a
+        # bounded window to finish them, otherwise stopping silently throws them away
+        if is_tl and not tl_engine_whisper and tl_outstanding[0] > 0:
+            bc.current_rec_status = "⚠️ Finishing translations"
+            update_status_lbl()
+            logger.info(f"Finishing {tl_outstanding[0]} pending translation(s)")
+            tl_drain_until[0] = time() + TL_DRAIN_S
+            tl_flush(TL_DRAIN_S)
+            if tl_outstanding[0] > 0:
+                logger.warning(f"Gave up on {tl_outstanding[0]} pending translation(s) after {TL_DRAIN_S:.0f}s")
+            with bc.tl_res_lock:
+                pending_tl = prev_tl_res
+            if pending_tl:
+                bc.tl_sentences.append(pending_tl)
+                bc.tl_sentences = unique_rec_list(bc.tl_sentences)
+                bc.update_tl(None, separator)
 
         bc.current_rec_status = "⚠️ Stopping stream"
         update_status_lbl()
@@ -1270,12 +1310,26 @@ def run_whisper_tl(audio, stable_tl, separator: str, with_lock, hallucination_fi
             else:
                 logger.debug(f"{text}")
 
-        prev_tl_res = result
+        with bc.tl_res_lock:
+            prev_tl_res = result
         bc.update_tl(result, separator)
 
 
-def tl_api(text: str, lang_source: str, lang_target: str, engine: str, separator: str, final: bool = False):
-    """Translate the result of realtime_recording_thread using translation API"""
+def tl_api(
+    text: str,
+    lang_source: str,
+    lang_target: str,
+    engine: str,
+    separator: str,
+    final: bool = False,
+    epoch: Optional[int] = None,
+):
+    """Translate the result of realtime_recording_thread using translation API
+
+    `epoch` is the value bc.tl_epoch had when this text was queued. A live partial whose epoch no
+    longer matches describes text the recording thread has already frozen, so its result is stale
+    and must not overwrite the current one.
+    """
     assert bc.mw is not None
     global prev_tl_res
 
@@ -1303,7 +1357,13 @@ def tl_api(text: str, lang_source: str, lang_target: str, engine: str, separator
                     del bc.tl_sentences[:len(bc.tl_sentences) - bc.max_sentences]
                 bc.update_tl(None, separator)
             else:
-                prev_tl_res = result.strip()
+                with bc.tl_res_lock:
+                    if epoch is not None and epoch != bc.tl_epoch:
+                        # the recording thread froze this text while we were translating it, so
+                        # showing this now would put a stale partial back on screen
+                        logger.debug("Dropping stale live translation from a previous epoch")
+                        return TL_OK
+                    prev_tl_res = result.strip()
                 bc.update_tl(result.strip(), separator)
         return TL_OK
     except Exception as e:
